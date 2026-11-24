@@ -1,36 +1,109 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Годовой обзор качества лекарственных препаратов — MVP
 
-## Getting Started
+Локальное веб-приложение для подготовки **черновика** годового обзора качества продукции (PQR/APQR) на основе загружаемых CSV/XLSX. Проект подготовлен как демонстрационный прототип для «Биннофарм Групп». Все встроенные примеры вымышлены.
 
-First, run the development server:
+## Быстрый запуск
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+Нужны Docker Desktop с запущенным движком и Docker Compose.
+
+```powershell
+docker compose up --build
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+После запуска:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+- интерфейс: http://localhost:3000
+- API и документация OpenAPI: http://localhost:8000/docs
+- проверка API: http://localhost:8000/health
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+На стартовом экране нажмите **«Открыть демо»**. Затем проверьте обзор, исходные записи и вкладку «Отчёт». Для чистого сценария создайте новый обзор, скачайте шаблон CSV на вкладке «Исходные данные», заполните его и загрузите. Дата в файле — `ГГГГ-ММ-ДД`, кодировка CSV — UTF-8 или Windows-1251; поддерживаются разделители `,` и `;`. Первая строка XLSX должна содержать названия столбцов. Данные каждого файла относятся к выбранному препарату, площадке и году.
 
-## Learn More
+Остановка: `docker compose down`. Данные сохраняются в именованном томе `postgres_data`. Для полного удаления демонстрационной базы: `docker compose down -v` — команда удаляет данные проекта.
 
-To learn more about Next.js, take a look at the following resources:
+## Возможности
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+1. Создание обзора по препарату, площадке и отчётному году.
+2. Импорт CSV/XLSX по 16 разделам: исходное сырьё, упаковочные материалы, серии, контроль процесса, контроль качества, отклонения, OOS/OOT, изменения, рекламации, CAPA, стабильность, отзывы, изменения в регистрационном досье, валидация, оборудование и помещения, технические соглашения.
+3. Предварительная проверка обязательных столбцов, пустых значений, формата и года даты, числовых показателей, границ спецификации и повторных идентификаторов. Файл с ошибками не записывается.
+4. Реестр источников импорта с именем файла, количеством строк, датой и SHA-256. Повторная загрузка того же файла отклоняется.
+5. Сводные показатели, список разделов без данных, графики результатов с границами спецификации и счётчик значений вне границ.
+6. Редактируемые заключение специалиста и предлагаемые действия. PDF содержит сводку, тренды, реестр загруженных сведений, пропуски, заключение и источники.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+**Важное смысловое различие:** «нет данных» означает, что источник не загружен; приложение не делает вывода, что событий не было. В PDF такой раздел обозначается явно.
 
-## Deploy on Vercel
+## Архитектура
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+```text
+Браузер
+   │
+   ▼
+Next.js (интерфейс, :3000)
+   │ JSON / multipart
+   ▼
+FastAPI (валидация, расчёты, PDF, :8000)
+   │ SQLAlchemy + psycopg
+   ▼
+PostgreSQL 17 (данные в Docker volume)
+```
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+**Модель данных:** `reviews` задаёт препарат, площадку, год и текст экспертной оценки; `quality_records` хранит дату, раздел, серию и поля записи в JSON; `import_runs` хранит происхождение загрузок. Ограничение уникальности не даёт создать два обзора для одной области. Импорт записей и журнала выполняется одной транзакцией.
+
+**Почему такой стек:**
+
+| Решение | Причина |
+| --- | --- |
+| Локальное веб-приложение | Единый интерфейс для специалистов без установки десктопного клиента; данные остаются в выбранном локальном контуре. |
+| Next.js 16 + TypeScript | Удобная компонентная разработка, строгая проверка типов и готовая сборка интерфейса. Серверная часть Next.js здесь не дублирует API. |
+| FastAPI + Pydantic | Явные контракты запросов, встроенная OpenAPI документация и удобная обработка файлов на Python. |
+| PostgreSQL 16 | Надёжное транзакционное хранение; JSON позволяет начать с разнотипных записей, сохранив общие поля для поиска и агрегации. |
+| SQLAlchemy | Отделяет модель хранения от HTTP и позволяет постепенно перейти к более строгим таблицам и миграциям. |
+| ReportLab | Формирует PDF на сервере без зависимости от браузерной печати; поддерживает кириллицу с DejaVu Sans в контейнере. |
+| Docker Compose | Воспроизводимый локальный запуск трёх компонентов одной командой. |
+
+**Дизайн:** в боковой панели используется логотип, предоставленный заказчиком для проекта. Интерфейс опирается на спокойную синюю и чёрную палитру корпоративной айдентики и рассчитан на работу с таблицами. Остальные цветовые и типографические токены пока являются адаптацией для MVP; при доступе к внутренней дизайн системе их следует сверить с брендбуком.
+
+## Инженерные границы MVP
+
+- Нет подключения к ERP, LIMS, QMS и регистрационным системам: загрузка файлов моделирует точку интеграции.
+- Нет учётных записей, ролей, электронной подписи, утверждения, неизменяемого аудита и компьютеризированной валидации. Поэтому прототип нельзя применять как промышленную GxP систему или архив утверждённых PQR.
+- График показывает фактические значения и указанные в файле границы; он не заменяет статистическую оценку тренда и экспертное заключение.
+- Схемы импорта намеренно компактны. Для внедрения нужно сопоставить поля с SOP, нормативным шаблоном и системами конкретной площадки.
+- PDF маркирован как черновик. Отсутствие раздела не трактуется как нулевое число событий.
+
+Нормативный ориентир: [Решение Совета ЕЭК № 77 от 03.11.2016, Правила GMP ЕАЭС](https://docs.eaeunion.org/documents/306/2586/). Основа визуального направления: [сообщение «Биннофарм Групп» о корпоративном бренде](https://www.binnopharmgroup.ru/press/news/2021/kholding-binnofarm-grupp-razrabotal-sobstvennyy-korporativnyy-brend/).
+
+## Разработка без Docker для приложения
+
+Для этого варианта PostgreSQL должен уже работать локально с базой `quality`, пользователем `quality` и паролем `quality` (или задайте `DATABASE_URL`).
+
+```powershell
+cd backend
+python -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+$env:DATABASE_URL="postgresql+psycopg://quality:quality@localhost:5432/quality"
+.venv\Scripts\uvicorn app.main:app --reload
+```
+
+В другом терминале:
+
+```powershell
+cd frontend
+npm ci
+$env:NEXT_PUBLIC_API_URL="http://localhost:8000"
+npm run dev
+```
+
+Таблицы создаются при старте API. Для промышленной эксплуатации следует заменить это на версионируемые миграции.
+
+## Проверка
+
+```powershell
+cd backend
+python -m pip install -r requirements-dev.txt
+python tests/smoke.py
+cd ../frontend
+npm run build
+npm run lint
+```
+
+Smoke test использует временную SQLite базу только для проверки HTTP сценария. Рабочая конфигурация приложения использует PostgreSQL.
