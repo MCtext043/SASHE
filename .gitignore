@@ -5,6 +5,7 @@
 .env
 .venv/
 *.pyc
+.coverage
 .chrome-preview/
 .chrome-preview-2/
 qa-*.png

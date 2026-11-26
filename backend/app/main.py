@@ -26,6 +26,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
 from sqlalchemy import Date, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, create_engine, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from .analysis import EVENTS, quality_signals, year_metrics
 
 
 class Settings(BaseSettings):
@@ -54,6 +55,8 @@ class Review(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     records: Mapped[list[QualityRecord]] = relationship(back_populates="review", cascade="all, delete-orphan")
     imports: Mapped[list[ImportRun]] = relationship(back_populates="review", cascade="all, delete-orphan")
+    attestations: Mapped[list[SectionAttestation]] = relationship(back_populates="review", cascade="all, delete-orphan")
+    findings: Mapped[list[EvidenceFinding]] = relationship(back_populates="review", cascade="all, delete-orphan")
 
 
 class QualityRecord(Base):
@@ -78,6 +81,31 @@ class ImportRun(Base):
     row_count: Mapped[int] = mapped_column(Integer)
     imported_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     review: Mapped[Review] = relationship(back_populates="imports")
+
+
+class SectionAttestation(Base):
+    __tablename__ = "section_attestations"
+    __table_args__ = (UniqueConstraint("review_id", "category", name="uq_attestation_category"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    review_id: Mapped[int] = mapped_column(ForeignKey("reviews.id"))
+    category: Mapped[str] = mapped_column(String(40))
+    source: Mapped[str] = mapped_column(String(255))
+    reviewer: Mapped[str] = mapped_column(String(160))
+    confirmed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    review: Mapped[Review] = relationship(back_populates="attestations")
+
+
+class EvidenceFinding(Base):
+    __tablename__ = "evidence_findings"
+    __table_args__ = (UniqueConstraint("review_id", "signal_key", name="uq_finding_signal"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    review_id: Mapped[int] = mapped_column(ForeignKey("reviews.id"))
+    signal_key: Mapped[str] = mapped_column(String(32))
+    title: Mapped[str] = mapped_column(String(255))
+    text: Mapped[str] = mapped_column(Text)
+    evidence_ids: Mapped[list[int]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    review: Mapped[Review] = relationship(back_populates="findings")
 
 
 SCHEMAS = {
@@ -119,6 +147,21 @@ class ReviewCreate(BaseModel):
 class ReviewUpdate(BaseModel):
     conclusion: str = Field(max_length=10000)
     actions: str = Field(max_length=10000)
+
+
+class AttestationCreate(BaseModel):
+    category: str
+    source: str = Field(min_length=3, max_length=255)
+    reviewer: str = Field(min_length=2, max_length=160)
+
+
+class FindingCreate(BaseModel):
+    signal_key: str
+    text: str = Field(min_length=5, max_length=3000)
+
+
+class FindingUpdate(BaseModel):
+    text: str = Field(min_length=5, max_length=3000)
 
 
 app = FastAPI(title="Биннофарм · Обзор качества", version="0.1.0")
@@ -170,7 +213,7 @@ def template(category: str):
 
 @app.get("/reviews")
 def list_reviews(session: Session = Depends(db)):
-    return [review_dict(x) for x in session.scalars(select(Review).order_by(Review.created_at.desc())).all()]
+    return [review_dict(x) for x in session.scalars(select(Review).order_by(Review.year.desc(), Review.created_at.desc())).all()]
 
 
 @app.post("/reviews", status_code=201)
@@ -268,6 +311,9 @@ async def import_file(review_id: int, category: str = Form(...), file: UploadFil
     review = review_or_404(session, review_id)
     if category not in SCHEMAS:
         raise HTTPException(400, "Неизвестный раздел")
+    if session.scalar(select(SectionAttestation).where(SectionAttestation.review_id == review_id,
+        SectionAttestation.category == category)):
+        raise HTTPException(409, "Сначала отзовите подтверждение отсутствия событий в этом разделе")
     content = await file.read()
     if len(content) > 5_000_000:
         raise HTTPException(413, "Максимальный размер файла — 5 МБ")
@@ -292,7 +338,10 @@ async def import_file(review_id: int, category: str = Form(...), file: UploadFil
         duplicates = [x for x in duplicates if x in known]
         if duplicates:
             return {"imported": 0, "errors": ["Уже загружены идентификаторы: " + ", ".join(duplicates[:20])]}
-    for row in rows:
+    for source_row, row in enumerate(rows, start=2):
+        row["_source_file"] = (file.filename or "")[:255]
+        row["_source_sha256"] = digest
+        row["_source_row"] = source_row
         session.add(QualityRecord(review_id=review_id, category=category,
             record_date=date.fromisoformat(row["date"]), batch_id=row.get("batch_id", ""), data=row))
     session.add(ImportRun(review_id=review_id, category=category, filename=(file.filename or "")[:255],
@@ -321,17 +370,47 @@ def snapshot(review: Review, session: Session) -> dict[str, Any]:
             value, lower, upper = numeric(data["result"]), numeric(data["lower_limit"]), numeric(data["upper_limit"])
             if not lower <= value <= upper:
                 out_of_spec += 1
-            groups[(data["parameter"], data["unit"])].append({"date": record.record_date.isoformat(), "value": value,
+            groups[(data["parameter"], data["unit"])].append({"id": record.id, "date": record.record_date.isoformat(), "value": value,
                 "lower": lower, "upper": upper, "batch_id": record.batch_id})
         for (parameter, unit), points in groups.items():
             series.append({"category": category, "parameter": parameter, "unit": unit, "points": points})
     imports = session.scalars(select(ImportRun).where(ImportRun.review_id == review.id)
                               .order_by(ImportRun.imported_at.desc())).all()
+    attestations = session.scalars(select(SectionAttestation).where(SectionAttestation.review_id == review.id)).all()
+    confirmed = {item.category: item for item in attestations}
+    statuses = {key: "loaded" if counts[key] else "confirmed_none" if key in confirmed else "missing"
+                for key in SCHEMAS}
+    source_by_category = defaultdict(list)
+    for item in imports:
+        source_by_category[item.category].append(item.filename)
+    def evidence(record: QualityRecord) -> dict[str, Any]:
+        source = record.data.get("_source_file")
+        if not source and len(source_by_category[record.category]) == 1:
+            source = source_by_category[record.category][0]
+        return {"id": record.id, "category": record.category, "date": record.record_date.isoformat(),
+                "batch_id": record.batch_id, "source": source or "Источник не установлен",
+                "source_row": record.data.get("_source_row"),
+                "data": record.data}
+    by_id = {r.id: r for r in records}
+    findings = session.scalars(select(EvidenceFinding).where(EvidenceFinding.review_id == review.id)
+                               .order_by(EvidenceFinding.created_at)).all()
+    previous = session.scalar(select(Review).where(Review.product == review.product, Review.site == review.site,
+                                                  Review.year == review.year - 1))
+    comparison = None
+    if previous:
+        prior_records = session.scalars(select(QualityRecord).where(QualityRecord.review_id == previous.id)).all()
+        comparison = {"previous_year": previous.year, "current": year_metrics(records),
+                      "previous": year_metrics(prior_records)}
     return {"review": review_dict(review), "counts": counts,
-            "missing": [key for key, count in counts.items() if count == 0],
-            "total": len(records), "out_of_spec": out_of_spec, "series": series,
-            "recent_records": [{"id": r.id, "category": r.category, "date": r.record_date.isoformat(),
-                                "batch_id": r.batch_id, "data": r.data} for r in records[-80:][::-1]],
+            "missing": [key for key, status in statuses.items() if status == "missing"],
+            "statuses": statuses, "total": len(records), "out_of_spec": out_of_spec, "series": series,
+            "signals": quality_signals(records), "comparison": comparison,
+            "attestations": [{"category": x.category, "source": x.source, "reviewer": x.reviewer,
+                              "confirmed_at": x.confirmed_at.isoformat()} for x in attestations],
+            "findings": [{"id": x.id, "signal_key": x.signal_key, "title": x.title, "text": x.text,
+                          "evidence": [evidence(by_id[i]) for i in x.evidence_ids if i in by_id]}
+                         for x in findings],
+            "recent_records": [evidence(r) for r in records[-80:][::-1]],
             "imports": [{"category": x.category, "filename": x.filename, "row_count": x.row_count,
                          "imported_at": x.imported_at.isoformat()} for x in imports]}
 
@@ -341,11 +420,127 @@ def get_snapshot(review_id: int, session: Session = Depends(db)):
     return snapshot(review_or_404(session, review_id), session)
 
 
+@app.get("/reviews/{review_id}/batches/{batch_id}/timeline")
+def batch_timeline(review_id: int, batch_id: str, session: Session = Depends(db)):
+    review_or_404(session, review_id)
+    records = session.scalars(select(QualityRecord).where(QualityRecord.review_id == review_id,
+        QualityRecord.batch_id == batch_id).order_by(QualityRecord.record_date, QualityRecord.id)).all()
+    if not records:
+        raise HTTPException(404, "Записи по серии не найдены")
+    return {"batch_id": batch_id, "records": [{"id": r.id, "category": r.category,
+        "date": r.record_date.isoformat(), "data": r.data} for r in records]}
+
+
+@app.post("/reviews/{review_id}/attestations", status_code=201)
+def attest_no_events(review_id: int, payload: AttestationCreate, session: Session = Depends(db)):
+    review_or_404(session, review_id)
+    if payload.category not in EVENTS:
+        raise HTTPException(400, "Для этого раздела подтверждение отсутствия событий недоступно")
+    if not payload.source.strip() or not payload.reviewer.strip():
+        raise HTTPException(400, "Укажите источник проверки и имя проверившего")
+    if session.scalar(select(QualityRecord.id).where(QualityRecord.review_id == review_id,
+        QualityRecord.category == payload.category)):
+        raise HTTPException(409, "В разделе уже есть записи; подтвердить ноль нельзя")
+    if session.scalar(select(SectionAttestation.id).where(SectionAttestation.review_id == review_id,
+        SectionAttestation.category == payload.category)):
+        raise HTTPException(409, "Отсутствие событий уже подтверждено")
+    item = SectionAttestation(review_id=review_id, category=payload.category,
+                              source=payload.source.strip(), reviewer=payload.reviewer.strip())
+    session.add(item)
+    session.commit()
+    return {"category": item.category, "source": item.source, "reviewer": item.reviewer,
+            "confirmed_at": item.confirmed_at.isoformat()}
+
+
+@app.delete("/reviews/{review_id}/attestations/{category}", status_code=204)
+def revoke_no_events(review_id: int, category: str, session: Session = Depends(db)):
+    review_or_404(session, review_id)
+    item = session.scalar(select(SectionAttestation).where(SectionAttestation.review_id == review_id,
+        SectionAttestation.category == category))
+    if not item:
+        raise HTTPException(404, "Подтверждение не найдено")
+    session.delete(item)
+    session.commit()
+    return Response(status_code=204)
+
+
+@app.post("/reviews/{review_id}/findings", status_code=201)
+def add_finding(review_id: int, payload: FindingCreate, session: Session = Depends(db)):
+    review_or_404(session, review_id)
+    if not payload.text.strip():
+        raise HTTPException(400, "Введите текст вывода")
+    if session.scalar(select(EvidenceFinding.id).where(EvidenceFinding.review_id == review_id,
+        EvidenceFinding.signal_key == payload.signal_key)):
+        raise HTTPException(409, "Этот сигнал уже добавлен в отчёт")
+    records = session.scalars(select(QualityRecord).where(QualityRecord.review_id == review_id)).all()
+    signal = next((x for x in quality_signals(records) if x["key"] == payload.signal_key), None)
+    if not signal:
+        raise HTTPException(404, "Сигнал не найден в текущих данных")
+    item = EvidenceFinding(review_id=review_id, signal_key=payload.signal_key,
+                           title=signal["title"], text=payload.text.strip(),
+                           evidence_ids=signal["evidence_ids"])
+    session.add(item)
+    session.commit()
+    return {"id": item.id, "title": item.title, "text": item.text, "evidence_ids": item.evidence_ids}
+
+
+@app.patch("/reviews/{review_id}/findings/{finding_id}")
+def edit_finding(review_id: int, finding_id: int, payload: FindingUpdate, session: Session = Depends(db)):
+    review_or_404(session, review_id)
+    item = session.scalar(select(EvidenceFinding).where(EvidenceFinding.id == finding_id,
+        EvidenceFinding.review_id == review_id))
+    if not item:
+        raise HTTPException(404, "Вывод не найден")
+    if not payload.text.strip():
+        raise HTTPException(400, "Введите текст вывода")
+    item.text = payload.text.strip()
+    session.commit()
+    return {"id": item.id, "text": item.text}
+
+
+@app.delete("/reviews/{review_id}/findings/{finding_id}", status_code=204)
+def delete_finding(review_id: int, finding_id: int, session: Session = Depends(db)):
+    review_or_404(session, review_id)
+    item = session.scalar(select(EvidenceFinding).where(EvidenceFinding.id == finding_id,
+        EvidenceFinding.review_id == review_id))
+    if not item:
+        raise HTTPException(404, "Вывод не найден")
+    session.delete(item)
+    session.commit()
+    return Response(status_code=204)
+
+
 @app.post("/demo", status_code=201)
 def create_demo(session: Session = Depends(db)):
     product, site, year = "Препарат А · таблетки 10 мг", "АЛИУМ · Оболенск", 2025
+    previous = session.scalar(select(Review).where(Review.product == product, Review.site == site, Review.year == 2024))
+    if not previous:
+        previous = Review(product=product, site=site, year=2024,
+                          conclusion="Показатели 2024 года использованы как база для сравнения.")
+        session.add(previous)
+        session.flush()
+        for index in range(1, 11):
+            batch = f"A24-{index:03d}"
+            day = index * 27
+            stamp = f"2024-{(day-1)//28+1:02d}-{(day-1)%28+1:02d}"
+            for category, values in [("batches", {"status": "Выпущена", "yield_pct": "98"}),
+                ("tests", {"parameter": "Растворение", "result": str(91 + index % 3), "unit": "%",
+                           "lower_limit": "80", "upper_limit": "100"})]:
+                payload = {"date": stamp, "batch_id": batch, "_source_file": "Демонстрационные данные", **values}
+                session.add(QualityRecord(review_id=previous.id, category=category,
+                    record_date=date.fromisoformat(stamp), batch_id=batch, data=payload))
+        for ident, day, batch in [("DEV-014", 100, "A24-004"), ("DEV-019", 210, "A24-008")]:
+            stamp = f"2024-{(day-1)//28+1:02d}-{(day-1)%28+1:02d}"
+            payload = {"id": ident, "date": stamp, "batch_id": batch, "status": "Закрыто",
+                       "description": "Отклонение процесса", "_source_file": "Демонстрационные данные"}
+            session.add(QualityRecord(review_id=previous.id, category="deviations",
+                record_date=date.fromisoformat(stamp), batch_id=batch, data=payload))
+        for category, count in [("batches", 10), ("tests", 10), ("deviations", 2)]:
+            session.add(ImportRun(review_id=previous.id, category=category, filename="Демонстрационные данные",
+                sha256=hashlib.sha256(f"demo:2024:{category}".encode()).hexdigest(), row_count=count))
     review = session.scalar(select(Review).where(Review.product == product, Review.site == site, Review.year == year))
     if review:
+        session.commit()
         return review_dict(review)
     review = Review(product=product, site=site, year=year,
         conclusion="Процесс в целом воспроизводим. Требуется оценить нисходящий тренд показателя растворения и закрытие отклонения DEV-024.",
@@ -411,12 +606,17 @@ def report_pdf(review_id: int, session: Session = Depends(db)):
     rows = [["Раздел", "Записей", "Состояние"]]
     for key in SCHEMAS:
         count = data["counts"][key]
-        rows.append([LABELS[key], str(count), "Загружен" if count else "Нет данных"])
+        status = {"loaded": "Загружен", "confirmed_none": "Подтверждён ноль", "missing": "Не проверено"}[data["statuses"][key]]
+        rows.append([LABELS[key], str(count), status])
     table = Table(rows, colWidths=[85*mm, 25*mm, 55*mm], repeatRows=1)
     table.setStyle(TableStyle([("FONTNAME", (0,0),(-1,-1),font), ("FONTSIZE",(0,0),(-1,-1),8),
         ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#E9F1F7")), ("LINEBELOW",(0,0),(-1,-1),0.3,colors.HexColor("#CAD7E1")),
         ("TOPPADDING",(0,0),(-1,-1),7), ("BOTTOMPADDING",(0,0),(-1,-1),7)]))
-    story += [table, Paragraph("2. Ключевые показатели", styles["HeadRu"]),
+    story.append(table)
+    for item in data["attestations"]:
+        story.append(Paragraph(escape(f"{LABELS[item['category']]}: отсутствие событий подтвердил(а) "
+            f"{item['reviewer']}; источник: {item['source']}; дата: {item['confirmed_at'][:10]}"), styles["SmallRu"]))
+    story += [Paragraph("2. Ключевые показатели", styles["HeadRu"]),
               Paragraph(f"Серий: {data['counts']['batches']}. Испытаний: {data['counts']['tests']}. "
                         f"Результатов вне указанных границ: {data['out_of_spec']}. "
                         f"Отклонений: {data['counts']['deviations']}. Рекламаций: {data['counts']['complaints']}.", styles["BodyRu"]),
@@ -428,7 +628,37 @@ def report_pdf(review_id: int, session: Session = Depends(db)):
                 f"n={len(values)}, min={min(values):g}, max={max(values):g}, среднее={sum(values)/len(values):.2f}", styles["BodyRu"]))
     else:
         story.append(Paragraph("Данные испытаний и стабильности не загружены.", styles["BodyRu"]))
-    story.append(Paragraph("4. Реестр сведений по разделам", styles["HeadRu"]))
+    if data["signals"]:
+        story.append(Paragraph("Сигналы для экспертной проверки", styles["HeadRu"]))
+        for item in data["signals"]:
+            story.append(Paragraph(escape(f"{item['title']} · {item['parameter']}: {item['detail']} "
+                f"Правило: {item['rule']} Записи: {', '.join(map(str, item['evidence_ids']))}."), styles["SmallRu"]))
+    story.append(Paragraph("4. Сравнение с предыдущим годом", styles["HeadRu"]))
+    comparison = data["comparison"]
+    if comparison:
+        for key, title in [("batches", "Серии"), ("deviations", "Отклонения"),
+                           ("complaints", "Рекламации"), ("oos", "OOS/OOT"), ("open_capa", "Открытые CAPA")]:
+            current_value = comparison["current"]["counts"][key]
+            previous_value = comparison["previous"]["counts"][key]
+            story.append(Paragraph(f"{title}: {comparison['previous_year']} — {previous_value}; "
+                                   f"{review.year} — {current_value}.", styles["SmallRu"]))
+        for key, title in [("deviations", "Отклонения"), ("complaints", "Рекламации"), ("oos", "OOS/OOT")]:
+            current_rate = comparison["current"]["rates_per_100_batches"][key]
+            previous_rate = comparison["previous"]["rates_per_100_batches"][key]
+            story.append(Paragraph(f"{title} на 100 серий: {comparison['previous_year']} — "
+                f"{previous_rate if previous_rate is not None else 'н/д'}; {review.year} — "
+                f"{current_rate if current_rate is not None else 'н/д'}.", styles["SmallRu"]))
+        prior_averages = {(item["category"], item["parameter"], item["unit"]): item
+                          for item in comparison["previous"]["averages"]}
+        for item in comparison["current"]["averages"]:
+            prior = prior_averages.get((item["category"], item["parameter"], item["unit"]))
+            if prior:
+                story.append(Paragraph(escape(f"{item['parameter']} ({item['unit']}): среднее "
+                    f"{comparison['previous_year']} — {prior['mean']}; {review.year} — {item['mean']} "
+                    f"(n={prior['n']} / {item['n']})."), styles["SmallRu"]))
+    else:
+        story.append(Paragraph("Обзор за предыдущий год не найден.", styles["BodyRu"]))
+    story.append(Paragraph("5. Реестр сведений по разделам", styles["HeadRu"]))
     record_rows = session.scalars(select(QualityRecord).where(QualityRecord.review_id == review.id)
                                   .order_by(QualityRecord.category, QualityRecord.record_date)).all()
     grouped = defaultdict(list)
@@ -437,16 +667,35 @@ def report_pdf(review_id: int, session: Session = Depends(db)):
     for key in SCHEMAS:
         story.append(Paragraph(f"{LABELS[key]} · {len(grouped[key])}", styles["HeadRu"]))
         if not grouped[key]:
-            story.append(Paragraph("Нет загруженных данных; отсутствие событий не подтверждено.", styles["SmallRu"]))
+            attestation = next((x for x in data["attestations"] if x["category"] == key), None)
+            if attestation:
+                story.append(Paragraph(escape(f"Отсутствие событий подтверждено. Источник: {attestation['source']}; "
+                                              f"проверил(а): {attestation['reviewer']}."), styles["SmallRu"]))
+            else:
+                story.append(Paragraph("Нет загруженных данных; отсутствие событий не подтверждено.", styles["SmallRu"]))
             continue
         for record in grouped[key]:
             fields = record.data
             detail = fields.get("description") or (f"{fields.get('parameter')}: {fields.get('result')} {fields.get('unit')} "
                 f"[{fields.get('lower_limit')}–{fields.get('upper_limit')}]" if fields.get("parameter") else fields.get("status", ""))
             story.append(Paragraph(escape(f"{record.record_date} · {record.batch_id or fields.get('id', '—')} · {detail}"), styles["SmallRu"]))
-    story += [Paragraph("5. Заключение специалиста", styles["HeadRu"]),
+    story.append(Paragraph("6. Выводы с доказательствами", styles["HeadRu"]))
+    if data["findings"]:
+        for item in data["findings"]:
+            story.append(Paragraph(escape(item["title"]), styles["HeadRu"]))
+            story.append(Paragraph(escape(item["text"]).replace("\n", "<br/>"), styles["BodyRu"]))
+            for record in item["evidence"]:
+                record_data = record["data"]
+                detail = (f"{record_data['parameter']}: {record_data['result']} {record_data.get('unit', '')}"
+                          if record_data.get("parameter") else record_data.get("description", ""))
+                story.append(Paragraph(escape(f"Запись #{record['id']} · {record['date']} · "
+                    f"{record['batch_id'] or 'без серии'} · {detail} · {record['source']}"
+                    f"{', строка ' + str(record['source_row']) if record['source_row'] else ''}"), styles["SmallRu"]))
+    else:
+        story.append(Paragraph("Доказательные выводы не добавлены.", styles["SmallRu"]))
+    story += [Paragraph("7. Заключение специалиста", styles["HeadRu"]),
               Paragraph(escape(review.conclusion or "Не заполнено.").replace("\n", "<br/>"), styles["BodyRu"]),
-              Paragraph("6. Предлагаемые действия", styles["HeadRu"]),
+              Paragraph("8. Предлагаемые действия", styles["HeadRu"]),
               Paragraph(escape(review.actions or "Не заполнено.").replace("\n", "<br/>"), styles["BodyRu"]),
               Paragraph("Источники данных", styles["HeadRu"])]
     for item in data["imports"]:
