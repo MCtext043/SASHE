@@ -16,17 +16,39 @@ services:
     build: ./backend
     environment:
       DATABASE_URL: postgresql+psycopg://quality:quality@db:5432/quality
-      CORS_ORIGIN: http://localhost:3000
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
+      AUTH_MODE: ${AUTH_MODE:-local}
+      LOCAL_ADMIN_PASSWORD: ${LOCAL_ADMIN_PASSWORD:-DemoAdmin2026!}
+      LOCAL_AUTHOR_PASSWORD: ${LOCAL_AUTHOR_PASSWORD:-DemoAuthor2026!}
+      LOCAL_REVIEWER_PASSWORD: ${LOCAL_REVIEWER_PASSWORD:-DemoReviewer2026!}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      SOURCE_BASE_URL: ${SOURCE_BASE_URL:-http://source:8001}
+      SOURCE_API_KEY: ${SOURCE_API_KEY:-demo-source-key}
+      SOURCE_ADAPTER_MODULE: ${SOURCE_ADAPTER_MODULE:-}
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-}
+      OIDC_GROUPS_CLAIM: ${OIDC_GROUPS_CLAIM:-groups}
+      OIDC_ROLE_GROUPS: ${OIDC_ROLE_GROUPS:-}
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:
       db:
         condition: service_healthy
+      source:
+        condition: service_started
+  source:
+    build: ./backend
+    command: uvicorn app.mock_source:app --host 0.0.0.0 --port 8001
+    environment:
+      SOURCE_API_KEY: ${SOURCE_API_KEY:-demo-source-key}
   web:
     build:
       context: ./frontend
       args:
-        NEXT_PUBLIC_API_URL: http://localhost:8000
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+        NEXT_PUBLIC_DEMO_MODE: ${NEXT_PUBLIC_DEMO_MODE:-1}
     ports:
       - "127.0.0.1:3000:3000"
     depends_on:

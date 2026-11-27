@@ -11,6 +11,7 @@ from openpyxl import Workbook
 
 with tempfile.TemporaryDirectory() as temporary:
     os.environ["DATABASE_URL"] = "sqlite:///" + (Path(temporary) / "smoke.db").as_posix()
+    os.environ["AUTH_MODE"] = "test"
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from app.main import app, engine
 

@@ -10,7 +10,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from openpyxl import load_workbook
@@ -32,6 +32,20 @@ from .analysis import EVENTS, quality_signals, year_metrics
 class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://quality:quality@localhost:5432/quality"
     cors_origin: str = "http://localhost:3000"
+    auth_mode: str = "local"
+    local_admin_password: str = ""
+    local_author_password: str = ""
+    local_reviewer_password: str = ""
+    cookie_secure: bool = False
+    source_base_url: str = ""
+    source_api_key: str = ""
+    source_adapter_module: str = ""
+    oidc_issuer: str = ""
+    oidc_client_id: str = ""
+    oidc_client_secret: str = ""
+    oidc_redirect_uri: str = ""
+    oidc_groups_claim: str = "groups"
+    oidc_role_groups: str = "{}"
 
 
 settings = Settings()
@@ -165,12 +179,14 @@ class FindingUpdate(BaseModel):
 
 
 app = FastAPI(title="Биннофарм · Обзор качества", version="0.1.0")
-app.add_middleware(CORSMiddleware, allow_origins=[settings.cors_origin], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=[settings.cors_origin], allow_methods=["*"],
+                   allow_headers=["*"], allow_credentials=True)
 
 
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(engine)
+    seed_local_users()
 
 
 def db():
@@ -202,11 +218,15 @@ def schemas():
 
 
 @app.get("/templates/{category}")
-def template(category: str):
+def template(category: str, review_id: int | None = None, session: Session = Depends(db)):
     if category not in SCHEMAS:
         raise HTTPException(404, "Неизвестный раздел")
     buffer = io.StringIO()
-    csv.writer(buffer).writerow(SCHEMAS[category])
+    extra = []
+    if review_id is not None:
+        review_or_404(session, review_id)
+        extra = profile_for_review(session, review_id)["extra_fields"].get(category, [])
+    csv.writer(buffer).writerow(list(dict.fromkeys(SCHEMAS[category] + extra)))
     return Response("\ufeff" + buffer.getvalue(), media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": f'attachment; filename="{category}.csv"'})
 
@@ -217,13 +237,18 @@ def list_reviews(session: Session = Depends(db)):
 
 
 @app.post("/reviews", status_code=201)
-def create_review(payload: ReviewCreate, session: Session = Depends(db)):
+def create_review(payload: ReviewCreate, request: Request, session: Session = Depends(db)):
+    require_roles(request, "author")
     existing = session.scalar(select(Review).where(Review.product == payload.product.strip(),
         Review.site == payload.site.strip(), Review.year == payload.year))
     if existing:
         return review_dict(existing)
     review = Review(product=payload.product.strip(), site=payload.site.strip(), year=payload.year)
     session.add(review)
+    session.flush()
+    bind_latest_profile(session, review)
+    audit_event(session, request, "review.created", f"review:{review.id}",
+                {"product": review.product, "site": review.site, "year": review.year})
     session.commit()
     session.refresh(review)
     return review_dict(review)
@@ -235,9 +260,13 @@ def get_review(review_id: int, session: Session = Depends(db)):
 
 
 @app.patch("/reviews/{review_id}")
-def update_review(review_id: int, payload: ReviewUpdate, session: Session = Depends(db)):
+def update_review(review_id: int, payload: ReviewUpdate, request: Request, session: Session = Depends(db)):
+    require_roles(request, "author")
     review = review_or_404(session, review_id)
+    ensure_editable(session, review_id)
     review.conclusion, review.actions = payload.conclusion, payload.actions
+    audit_event(session, request, "review.text_updated", f"review:{review_id}",
+                {"conclusion_length": len(payload.conclusion), "actions_length": len(payload.actions)})
     session.commit()
     return review_dict(review)
 
@@ -263,9 +292,10 @@ def parse_file(content: bytes, filename: str) -> list[dict[str, str]]:
     raise HTTPException(400, "Поддерживаются CSV и XLSX")
 
 
-def validate_rows(rows: list[dict[str, str]], category: str, year: int):
+def validate_rows(rows: list[dict[str, str]], category: str, year: int,
+                  extra_required: list[str] | None = None):
     errors: list[str] = []
-    columns = SCHEMAS[category]
+    columns = list(dict.fromkeys(SCHEMAS[category] + (extra_required or [])))
     if not rows:
         return ["Файл не содержит строк данных"]
     missing = [col for col in columns if col not in rows[0]]
@@ -306,9 +336,11 @@ def validate_rows(rows: list[dict[str, str]], category: str, year: int):
 
 
 @app.post("/reviews/{review_id}/imports")
-async def import_file(review_id: int, category: str = Form(...), file: UploadFile = File(...),
-                      session: Session = Depends(db)):
+async def import_file(review_id: int, request: Request, category: str = Form(...),
+                      file: UploadFile = File(...), session: Session = Depends(db)):
+    require_roles(request, "author")
     review = review_or_404(session, review_id)
+    ensure_editable(session, review_id)
     if category not in SCHEMAS:
         raise HTTPException(400, "Неизвестный раздел")
     if session.scalar(select(SectionAttestation).where(SectionAttestation.review_id == review_id,
@@ -327,7 +359,8 @@ async def import_file(review_id: int, category: str = Form(...), file: UploadFil
         if isinstance(exc, HTTPException):
             raise
         raise HTTPException(400, "Не удалось прочитать файл") from exc
-    errors = validate_rows(rows, category, review.year)
+    profile = profile_for_review(session, review_id)
+    errors = validate_rows(rows, category, review.year, profile["extra_fields"].get(category, []))
     if errors:
         return {"imported": 0, "errors": errors}
     if category not in ("tests", "stability", "process"):
@@ -346,6 +379,8 @@ async def import_file(review_id: int, category: str = Form(...), file: UploadFil
             record_date=date.fromisoformat(row["date"]), batch_id=row.get("batch_id", ""), data=row))
     session.add(ImportRun(review_id=review_id, category=category, filename=(file.filename or "")[:255],
         sha256=digest, row_count=len(rows)))
+    audit_event(session, request, "file.imported", f"review:{review_id}",
+                {"category": category, "filename": (file.filename or "")[:255], "count": len(rows), "sha256": digest})
     session.commit()
     return {"imported": len(rows), "errors": []}
 
@@ -355,6 +390,7 @@ def numeric(value: str) -> float:
 
 
 def snapshot(review: Review, session: Session) -> dict[str, Any]:
+    profile = profile_for_review(session, review.id)
     records = session.scalars(select(QualityRecord).where(QualityRecord.review_id == review.id)
                               .order_by(QualityRecord.record_date)).all()
     by_category = defaultdict(list)
@@ -401,10 +437,11 @@ def snapshot(review: Review, session: Session) -> dict[str, Any]:
         prior_records = session.scalars(select(QualityRecord).where(QualityRecord.review_id == previous.id)).all()
         comparison = {"previous_year": previous.year, "current": year_metrics(records),
                       "previous": year_metrics(prior_records)}
-    return {"review": review_dict(review), "counts": counts,
-            "missing": [key for key, status in statuses.items() if status == "missing"],
+    return {"review": review_dict(review), "profile": profile,
+            "workflow": workflow_dict(workflow_for_review(session, review.id)), "counts": counts,
+            "missing": [key for key in profile["required_sections"] if statuses[key] == "missing"],
             "statuses": statuses, "total": len(records), "out_of_spec": out_of_spec, "series": series,
-            "signals": quality_signals(records), "comparison": comparison,
+            "signals": quality_signals(records, profile["near_limit_pct"]), "comparison": comparison,
             "attestations": [{"category": x.category, "source": x.source, "reviewer": x.reviewer,
                               "confirmed_at": x.confirmed_at.isoformat()} for x in attestations],
             "findings": [{"id": x.id, "signal_key": x.signal_key, "title": x.title, "text": x.text,
@@ -432,8 +469,11 @@ def batch_timeline(review_id: int, batch_id: str, session: Session = Depends(db)
 
 
 @app.post("/reviews/{review_id}/attestations", status_code=201)
-def attest_no_events(review_id: int, payload: AttestationCreate, session: Session = Depends(db)):
+def attest_no_events(review_id: int, payload: AttestationCreate, request: Request,
+                     session: Session = Depends(db)):
+    require_roles(request, "author")
     review_or_404(session, review_id)
+    ensure_editable(session, review_id)
     if payload.category not in EVENTS:
         raise HTTPException(400, "Для этого раздела подтверждение отсутствия событий недоступно")
     if not payload.source.strip() or not payload.reviewer.strip():
@@ -447,46 +487,61 @@ def attest_no_events(review_id: int, payload: AttestationCreate, session: Sessio
     item = SectionAttestation(review_id=review_id, category=payload.category,
                               source=payload.source.strip(), reviewer=payload.reviewer.strip())
     session.add(item)
+    audit_event(session, request, "absence.confirmed", f"review:{review_id}",
+                {"category": item.category, "source": item.source, "reviewer": item.reviewer})
     session.commit()
     return {"category": item.category, "source": item.source, "reviewer": item.reviewer,
             "confirmed_at": item.confirmed_at.isoformat()}
 
 
 @app.delete("/reviews/{review_id}/attestations/{category}", status_code=204)
-def revoke_no_events(review_id: int, category: str, session: Session = Depends(db)):
+def revoke_no_events(review_id: int, category: str, request: Request, session: Session = Depends(db)):
+    require_roles(request, "author")
     review_or_404(session, review_id)
+    ensure_editable(session, review_id)
     item = session.scalar(select(SectionAttestation).where(SectionAttestation.review_id == review_id,
         SectionAttestation.category == category))
     if not item:
         raise HTTPException(404, "Подтверждение не найдено")
     session.delete(item)
+    audit_event(session, request, "absence.revoked", f"review:{review_id}", {"category": category})
     session.commit()
     return Response(status_code=204)
 
 
 @app.post("/reviews/{review_id}/findings", status_code=201)
-def add_finding(review_id: int, payload: FindingCreate, session: Session = Depends(db)):
+def add_finding(review_id: int, payload: FindingCreate, request: Request,
+                session: Session = Depends(db)):
+    require_roles(request, "author")
     review_or_404(session, review_id)
+    ensure_editable(session, review_id)
     if not payload.text.strip():
         raise HTTPException(400, "Введите текст вывода")
     if session.scalar(select(EvidenceFinding.id).where(EvidenceFinding.review_id == review_id,
         EvidenceFinding.signal_key == payload.signal_key)):
         raise HTTPException(409, "Этот сигнал уже добавлен в отчёт")
     records = session.scalars(select(QualityRecord).where(QualityRecord.review_id == review_id)).all()
-    signal = next((x for x in quality_signals(records) if x["key"] == payload.signal_key), None)
+    profile = profile_for_review(session, review_id)
+    signal = next((x for x in quality_signals(records, profile["near_limit_pct"])
+                   if x["key"] == payload.signal_key), None)
     if not signal:
         raise HTTPException(404, "Сигнал не найден в текущих данных")
     item = EvidenceFinding(review_id=review_id, signal_key=payload.signal_key,
                            title=signal["title"], text=payload.text.strip(),
                            evidence_ids=signal["evidence_ids"])
     session.add(item)
+    audit_event(session, request, "finding.created", f"review:{review_id}",
+                {"signal_key": item.signal_key, "evidence_ids": item.evidence_ids})
     session.commit()
     return {"id": item.id, "title": item.title, "text": item.text, "evidence_ids": item.evidence_ids}
 
 
 @app.patch("/reviews/{review_id}/findings/{finding_id}")
-def edit_finding(review_id: int, finding_id: int, payload: FindingUpdate, session: Session = Depends(db)):
+def edit_finding(review_id: int, finding_id: int, payload: FindingUpdate,
+                 request: Request, session: Session = Depends(db)):
+    require_roles(request, "author")
     review_or_404(session, review_id)
+    ensure_editable(session, review_id)
     item = session.scalar(select(EvidenceFinding).where(EvidenceFinding.id == finding_id,
         EvidenceFinding.review_id == review_id))
     if not item:
@@ -494,24 +549,29 @@ def edit_finding(review_id: int, finding_id: int, payload: FindingUpdate, sessio
     if not payload.text.strip():
         raise HTTPException(400, "Введите текст вывода")
     item.text = payload.text.strip()
+    audit_event(session, request, "finding.updated", f"review:{review_id}", {"finding_id": finding_id})
     session.commit()
     return {"id": item.id, "text": item.text}
 
 
 @app.delete("/reviews/{review_id}/findings/{finding_id}", status_code=204)
-def delete_finding(review_id: int, finding_id: int, session: Session = Depends(db)):
+def delete_finding(review_id: int, finding_id: int, request: Request, session: Session = Depends(db)):
+    require_roles(request, "author")
     review_or_404(session, review_id)
+    ensure_editable(session, review_id)
     item = session.scalar(select(EvidenceFinding).where(EvidenceFinding.id == finding_id,
         EvidenceFinding.review_id == review_id))
     if not item:
         raise HTTPException(404, "Вывод не найден")
     session.delete(item)
+    audit_event(session, request, "finding.deleted", f"review:{review_id}", {"finding_id": finding_id})
     session.commit()
     return Response(status_code=204)
 
 
 @app.post("/demo", status_code=201)
-def create_demo(session: Session = Depends(db)):
+def create_demo(request: Request, session: Session = Depends(db)):
+    require_roles(request, "author")
     product, site, year = "Препарат А · таблетки 10 мг", "АЛИУМ · Оболенск", 2025
     previous = session.scalar(select(Review).where(Review.product == product, Review.site == site, Review.year == 2024))
     if not previous:
@@ -547,6 +607,7 @@ def create_demo(session: Session = Depends(db)):
         actions="Проверить причины тренда растворения; завершить CAPA-011; подтвердить эффективность мер в следующем обзоре.")
     session.add(review)
     session.flush()
+    bind_latest_profile(session, review)
     def add(category: str, day: int, batch: str, **data: str):
         payload = {"date": f"2025-{(day-1)//28+1:02d}-{(day-1)%28+1:02d}", "batch_id": batch, **data}
         session.add(QualityRecord(review_id=review.id, category=category,
@@ -573,6 +634,7 @@ def create_demo(session: Session = Depends(db)):
                              ("deviations", 1), ("oos", 1), ("changes", 1), ("complaints", 1), ("capa", 1)]:
         session.add(ImportRun(review_id=review.id, category=category, filename="Демонстрационные данные",
             sha256=hashlib.sha256(f"demo:{category}".encode()).hexdigest(), row_count=count))
+    audit_event(session, request, "demo.created", f"review:{review.id}", {"year": year})
     session.commit()
     return review_dict(review)
 
@@ -602,6 +664,8 @@ def report_pdf(review_id: int, session: Session = Depends(db)):
     story = [Paragraph("Годовой обзор качества продукции", styles["TitleRu"]),
              Paragraph(f"{escape(review.product)} · {escape(review.site)} · {review.year}", styles["BodyRu"]),
              Paragraph("ЧЕРНОВИК · требует проверки и утверждения специалистом по качеству", styles["BodyRu"]),
+             Paragraph(escape(f"Профиль данных: {data['profile']['label']}; порог раннего сигнала: "
+                              f"{data['profile']['near_limit_pct']:g}%"), styles["SmallRu"]),
              Paragraph("1. Полнота исходных данных", styles["HeadRu"])]
     rows = [["Раздел", "Записей", "Состояние"]]
     for key in SCHEMAS:
@@ -705,3 +769,8 @@ def report_pdf(review_id: int, session: Session = Depends(db)):
     doc.build(story)
     return Response(buffer.getvalue(), media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="quality-review-{review.year}.pdf"'})
+
+
+# Loaded after all routes and models so governance can reuse the base and PDF renderer.
+from .governance import (audit_event, bind_latest_profile, ensure_editable, profile_for_review,
+                         require_roles, seed_local_users, workflow_dict, workflow_for_review)  # noqa: E402

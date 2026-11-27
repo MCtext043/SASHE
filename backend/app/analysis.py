@@ -12,7 +12,7 @@ def number(value):
     return float(str(value).replace(",", "."))
 
 
-def quality_signals(records):
+def quality_signals(records, near_limit_pct: float = 15.0):
     groups = defaultdict(list)
     for record in records:
         if record.category not in MEASURED:
@@ -53,13 +53,13 @@ def quality_signals(records):
         last = points[-1]
         width = last["upper"] - last["lower"]
         if width > 0 and last["lower"] <= last["value"] <= last["upper"]:
-            if last["value"] - last["lower"] <= width * .15:
+            if last["value"] - last["lower"] <= width * near_limit_pct / 100:
                 signal("lower_near", "Значение приближается к нижней границе",
-                       "Последнее значение в пределах 15% ширины диапазона от нижней границы.", [last],
+                       f"Последнее значение в пределах {near_limit_pct:g}% ширины диапазона от нижней границы.", [last],
                        f"{last['value']:g} {unit}; нижняя граница {last['lower']:g} {unit}.")
-            elif last["upper"] - last["value"] <= width * .15:
+            elif last["upper"] - last["value"] <= width * near_limit_pct / 100:
                 signal("upper_near", "Значение приближается к верхней границе",
-                       "Последнее значение в пределах 15% ширины диапазона от верхней границы.", [last],
+                       f"Последнее значение в пределах {near_limit_pct:g}% ширины диапазона от верхней границы.", [last],
                        f"{last['value']:g} {unit}; верхняя граница {last['upper']:g} {unit}.")
     priority = {"outside": 0, "falling": 1, "rising": 1, "lower_near": 2, "upper_near": 2}
     return sorted(result, key=lambda item: (priority[item["kind"]], item["category"], item["parameter"]))

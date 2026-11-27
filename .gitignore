@@ -11,3 +11,5 @@
 qa-*.png
 frontend/qa-*.png
 dev-preview.db
+# Local demo assets and generated product mockups
+/demo/
